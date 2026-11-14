@@ -1,0 +1,9 @@
+# 单腿测试生成的CSV日志（实测记录请另行归档）
+/logs/
+
+# Python 离线计算缓存
+__pycache__/
+*.py[cod]
+
+# uv 项目虚拟环境（保留 pyproject.toml、uv.lock 和 .python-version）
+/.venv/

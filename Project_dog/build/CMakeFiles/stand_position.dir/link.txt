@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/stand_position.dir/stand_position.cpp.o -o stand_position  -Wl,-rpath,/home/neo/Project-Dog_项目及说明文档/Project-Dog_交接包/Project-Dog/build/thirdparty/soem -lm libmotor.a -lm thirdparty/soem/libsoem.so -lpthread -lrt 

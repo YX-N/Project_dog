@@ -1,0 +1,12 @@
+[project]
+name = "project-dog-offline"
+version = "0.1.0"
+description = "Project-Dog 左前腿离线运动学计算工具"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.20",
+]
+
+[tool.uv]
+# 混合 C/C++ 与独立 Python 脚本项目，只管理依赖，不构建 Python 包。
+package = false
