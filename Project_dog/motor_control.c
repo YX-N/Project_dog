@@ -85,7 +85,7 @@ void MotorSetting(EtherCAT_Msg* tx_msg, uint16_t motor_id, uint8_t cmd)
  *
  * 使用CAN1重置，重置后电机ID为1。
  *
- * @param tx_msg 指向存储构建的CAN消息的指针。
+ * @param tx_msg 指向存储构建EtherCAT_Msg的CAN消息的指针。
  *
  * @return None
  */
