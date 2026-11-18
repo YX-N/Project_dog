@@ -620,7 +620,7 @@ int startBus()
         direct_active = direct_pending = false;
         direct_serial = direct_completed = cycle_direct_serial = 0;
     }
-    EtherCAT_Init((char*)"enp4s0");
+    EtherCAT_Init((char*)"eno1");
     return inOP ? 1 : 0;
 }
 /**
