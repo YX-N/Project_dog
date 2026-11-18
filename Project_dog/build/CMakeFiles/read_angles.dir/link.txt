@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/read_angles.dir/read_angles.cpp.o -o read_angles  -Wl,-rpath,/home/neo/Project-Dog_项目及说明文档/Project-Dog_交接包/Project-Dog/build/thirdparty/soem -lm libmotor.a -lm thirdparty/soem/libsoem.so -lpthread -lrt 

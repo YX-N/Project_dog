@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/jump_mit.dir/jump_mit.cpp.o -o jump_mit  -Wl,-rpath,/home/neo/Project-Dog_项目及说明文档/Project-Dog_交接包/Project-Dog/build/thirdparty/soem -lm libmotor.a -lm thirdparty/soem/libsoem.so -lpthread -lrt 
