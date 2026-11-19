@@ -1,3 +1,10 @@
+/*
+ * 功能：通过 MIT 控制完成单腿多次跳跃，按指定周期重复并记录实验数据。
+ * 流程：初始化通信 → 查询电机角度 → 站立 → 循环下蹲、蹬伸、落地、缓冲、回站
+ *       → 保持站立 → 退出时保存跳跃汇总及逐周期 CSV。
+ * 说明：根据总质量调整重力前馈和落地增益；周期超时不截断动作。
+ */
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -25,26 +32,31 @@
 namespace {
 using Clock = std::chrono::steady_clock;
 using Pose = std::array<double, MOTOR_JOINT_COUNT>;
+// MIT 协议用弧度和弧度/秒，轨迹规划内部用度和度/秒。
 constexpr double rad_per_deg = 3.14159265358979323846 / 180.0;
 constexpr double hip_deg = -2.905567;
 // 数组顺序：[ID1膝, ID2大腿, ID3]，内部位置和速度使用度、度/秒。
-constexpr Pose stand {17.61, 12.53, hip_deg};
-constexpr Pose crouch{57.57, 26.10, hip_deg};
-constexpr Pose push  {-13.20, 1.99, hip_deg};
-constexpr Pose land  {11.96, 10.60, hip_deg};
-constexpr Pose land_deep{71.00, 30.61, hip_deg};
-constexpr double slow_deg_s = 115.0;
-constexpr double gain_transition_s = 0.030;
-constexpr double push_ramp_s = 0.040;
-constexpr double flight_duration_s = 0.090;
-enum class Profile { Linear, Quintic };
+constexpr Pose stand {17.61, 12.53, hip_deg};      // 站立姿态的三个关节目标角度（°）
+constexpr Pose crouch{57.57, 26.10, hip_deg};      // 下蹲姿态的三个关节目标角度（°）
+constexpr Pose push  {-13.20, 1.99, hip_deg};       // 起跳蹬伸姿态的三个关节目标角度（°）
+constexpr Pose land  {11.96, 10.60, hip_deg};       // 落地姿态的三个关节目标角度（°）
+constexpr Pose land_deep{71.00, 30.61, hip_deg};   // 深蹲缓冲姿态的三个关节目标角度（°）
+
+constexpr double slow_deg_s = 115.0;         // 慢速运动的关节角速度（°/s）
+constexpr double gain_transition_s = 0.030;  // 控制增益切换过渡时间（30 ms）
+constexpr double push_ramp_s = 0.040;        // 起跳蹬伸指令渐变时间（40 ms）
+constexpr double flight_duration_s = 0.090;  // 预设腾空持续时间（90 ms）
+enum class Profile { Linear, Quintic }; // 定义运动轨迹类型：线性插值、五次多项式插值
+
 struct Gains { double kp, kd; };
+// 正常运动和蹬伸阶段的关节刚度、阻尼。
 constexpr Gains normal{80.0, 2.0};
 constexpr Gains pushing{250.0, 3.0};
-volatile std::sig_atomic_t quit = 0;
 
+volatile std::sig_atomic_t quit = 0;
 void request_exit(int) { quit = 1; }
 
+// 记录单次跳跃的逐周期指令和反馈，供 CSV 导出。
 struct CycleLog {
     struct Row {
         double t;
@@ -59,6 +71,15 @@ struct CycleLog {
     CycleLog(Clock::time_point start, std::chrono::system_clock::time_point wall_start)
         : start(start), wall_start(wall_start) {}
 
+    /**
+     * @brief 记录一个 EtherCAT 通信周期的电机指令与反馈
+     * @param sent    本周期提交的 EtherCAT 发送报文
+     * @param phase   当前运动阶段（如起跳、腾空、落地）
+     * @param context 指向 CycleLog 日志对象的通用指针
+     *
+     * 记录两个电机的目标位置、目标速度、Kp、Kd、
+     * 实际位置、实际速度和实际电流。
+     */
     static void observe(const EtherCAT_Msg& sent, const char* phase, void* context) {
         auto& log = *static_cast<CycleLog*>(context);
         Row row{};
@@ -85,9 +106,10 @@ struct CycleLog {
             if (feedback.observed[1] != Clock::time_point{}) out[5] = feedback.velocity_deg_s;
             if (feedback.observed[2] != Clock::time_point{}) out[6] = feedback.current_A;
         }
-        log.rows.push_back(row);
+        log.rows.push_back(row); // 将本周期数据追加到日志。
     }
 
+    // 将保存的周期数据输出为 CSV 文件。
     void save(const std::string& path) const {
         std::ofstream csv;
         csv.exceptions(std::ios::failbit | std::ios::badbit);
@@ -110,8 +132,10 @@ struct CycleLog {
 };
 
 // 动作与逐周期报文解码沿用jump_mit；本程序只增加循环、质量缩放和分次统计。
+// 管理多次跳跃的汇总统计，以及需要保留的逐周期记录。
 struct TestLog {
     static constexpr double missing = std::numeric_limits<double>::quiet_NaN();
+    // 每次跳跃的统计结果。
     struct Summary {
         int index;
         double start_time;
@@ -138,6 +162,7 @@ struct TestLog {
     TestLog(Clock::time_point start, std::chrono::system_clock::time_point wall_start, int count)
         : start(start), wall_start(wall_start), requested_count(count) {}
 
+    // 开始新一轮跳跃，创建本次记录。
     void begin(int index, Clock::time_point when) {
         auto next = std::make_shared<Jump>(index,
             std::chrono::duration<double>(when - start).count(), start, wall_start);
@@ -145,6 +170,7 @@ struct TestLog {
         active = std::move(next);
     }
 
+    // 收发线程回调：采样本次跳跃并统计蹬伸、落地峰值电流。
     static void observe(const EtherCAT_Msg& sent, const char* phase, void* context) {
         auto& log = *static_cast<TestLog*>(context);
         std::lock_guard<std::mutex> lock(log.mutex);
@@ -168,6 +194,7 @@ struct TestLog {
         }
     }
 
+    // 缓冲完成后，确认本次跳跃并写入统计结果。
     Summary complete(double flight_time) {
         std::lock_guard<std::mutex> lock(mutex);
         active->summary.flight_time = flight_time;
@@ -176,6 +203,7 @@ struct TestLog {
         return active->summary;
     }
 
+    // 结束当前周期，保留指定跳次及最后一次的详细记录。
     void finish_period() {
         std::lock_guard<std::mutex> lock(mutex);
         if (!active) return;
@@ -187,6 +215,7 @@ struct TestLog {
         active.reset();
     }
 
+    // 保存全部跳跃汇总和选定跳次的逐周期 CSV。
     bool save(double mass, double period) const {
         // 必须在stopBus之后调用，此时不再有收发线程追加数据。
         try {
@@ -240,6 +269,7 @@ struct TestLog {
     }
 };
 
+// 封装三轴 MIT 指令、增益切换和完整跳跃动作。
 struct Leg {
     EtherCAT_Msg command{};
     Pose commanded{0.0, 0.0, hip_deg};
@@ -256,6 +286,7 @@ struct Leg {
     Leg(double tor_ff_stand, double tor_ff_crouch, double tor_fric)
         : tor_ff_stand(tor_ff_stand), tor_ff_crouch(tor_ff_crouch), tor_fric(tor_fric) {}
 
+    // 按时间线性平滑切换 Kp、Kd，减少突变。
     Gains gains_at(Clock::time_point now) const {
         const double elapsed = std::chrono::duration<double>(now - gain_begin).count();
         const double blend = std::clamp(elapsed / gain_duration, 0.0, 1.0);
@@ -263,10 +294,12 @@ struct Leg {
                 gain_from.kd + (gain_target.kd - gain_from.kd) * blend};
     }
 
+    // 每个控制周期计算增益、前馈力矩，并发送三轴 MIT 指令。
     void tick() {
         // 即使只保持目标，也每周期更新增益渐变；ID3仍全程使用固定80/2。
         const auto now = Clock::now();
         const Gains gains = gains_at(now);
+        // 用膝关节目标位置插值站立、下蹲姿态对应的重力前馈。
         const double k = std::clamp((commanded[0] - stand[0]) / (crouch[0] - stand[0]), 0.0, 1.0);
         const bool disable_ff = in_flight || !std::strcmp(phase, "land_arm") ||
                                 !std::strcmp(phase, "land_wait");
@@ -289,6 +322,7 @@ struct Leg {
         exchangeMotorFrame(command, phase);
     }
 
+    // 开始 MIT 控制前，查询 ID1、ID2 的初始位置。
     void sample() {
         // 先独立查询初始位置，再开始三轴纯MIT控制，不能与ID3指令混装。
         for (int i = 0; i < 2 && !quit; ++i) {
@@ -297,6 +331,7 @@ struct Leg {
         }
     }
 
+    // 更新目标位置、速度和增益；ID3始终保持固定姿态。
     void set(const Pose& position, const Pose& velocity, Gains gains,
              double transition_s = gain_transition_s) {
         if (gains.kp != gain_target.kp || gains.kd != gain_target.kd) {
@@ -312,6 +347,7 @@ struct Leg {
         commanded_velocity[2] = 0.0;
     }
 
+    // 按线性或五次曲线从当前指令姿态运动到目标姿态。
     void move(const char* name, const Pose& target, double knee_deg_s, Gains gains,
               Profile profile = Profile::Linear, double fixed_duration = -1.0,
               double transition_s = gain_transition_s) {
@@ -350,6 +386,7 @@ struct Leg {
         }
     }
 
+    // 蹬伸阶段：先加速，再按设定速度运动到 push。
     void push_off(double v_push) {
         if (quit) return;
         phase = "push";
@@ -386,6 +423,7 @@ struct Leg {
         }
     }
 
+    // 使用实测位置和速度规划平滑过渡轨迹。
     void move_from_feedback(const char* name, const Pose& target, double duration,
                             Gains gains, bool flying) {
         if (quit) return;
@@ -422,10 +460,12 @@ struct Leg {
         }
     }
 
+    // 腾空阶段：在预定时长内切换到落地姿态。
     void fly_to_land(Gains landing) {
         move_from_feedback("land", land, flight_duration_s, landing, true);
     }
 
+    // 落地布防：等待位置和速度在阈值内稳定 20 ms。
     void land_arm(Gains landing, double arm_deg) {
         if (quit) return;
         phase = "land_arm";
@@ -450,6 +490,7 @@ struct Leg {
         }
     }
 
+    // 等待触地：根据膝关节位置偏差或速度判断。
     void land_wait(Gains landing, double td_deg, double td_vel, bool timeout_enabled) {
         if (quit) return;
         phase = "land_wait";
@@ -467,6 +508,7 @@ struct Leg {
         }
     }
 
+    // 触地缓冲：以逐渐减小的速度运动到深蹲位置。
     void absorb(double v_abs0, Gains gains) {
         if (quit) return;
         phase = "absorb";
@@ -498,10 +540,12 @@ struct Leg {
         }
     }
 
+    // 用五次曲线平滑恢复站立。
     void return_to_stand() {
         move("stand_return", stand, slow_deg_s, normal, Profile::Quintic, 0.5, 0.5);
     }
 
+    // 在指定时长内持续发送保持姿态的指令。
     void hold(const Pose& target, Gains gains, double seconds, const char* name) {
         if (quit) return;
         phase = name;
@@ -511,6 +555,7 @@ struct Leg {
         while (!quit && std::chrono::duration<double>(Clock::now() - begin).count() < seconds) tick();
     }
 
+    // 持续保持目标姿态，直到收到退出信号。
     void hold_forever(const Pose& target, Gains gains, const char* name) {
         if (quit) return;
         phase = name;
@@ -520,6 +565,7 @@ struct Leg {
     }
 };
 
+// 输出命令行参数及使用说明。
 void usage(const char* program) {
     std::printf("用法: %s <V_PUSH deg/s> <周期 s> <次数> <总质量 kg> [V_ABS0=450] [Kp_ABS=40] [Kd_ABS=3.5] [TOR_FRIC=1.5]\n"
                 "周期包含下蹲、跳跃、缓冲和回站，回站后等待周期结束；超期不截断动作。\n"
@@ -535,6 +581,7 @@ int main(int argc, char** argv)
         usage(argv[0]);
         return argc == 2 && (!std::strcmp(argv[1], "--help") || !std::strcmp(argv[1], "-h")) ? 0 : 1;
     }
+    // 必填参数：蹬伸速度、跳跃周期、总运动质量。
     double v_push, period, mass;
     double v_abs0 = 450.0, tor_fric = 1.5;
     Gains absorption{40.0, 3.5};
@@ -563,10 +610,12 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    // 以 6.2 kg 为基准，缩放落地增益和重力前馈。
     const double mass_scale = mass / 6.2;
     const Gains landing{25.0 * mass_scale, std::min(5.0, 3.0 * mass_scale)};
     std::signal(SIGINT, request_exit);
     std::signal(SIGTERM, request_exit);
+    // 注册 PDO 周期回调，用于同步记录控制指令和反馈。
     TestLog log(program_start, wall_start, count);
     setMotorCycleObserver(TestLog::observe, &log);
     if (!startBus()) {
@@ -579,6 +628,7 @@ int main(int argc, char** argv)
     Leg leg(-3.0 * mass_scale, -4.5 * mass_scale, tor_fric);
     leg.sample();
     leg.move("stand", stand, slow_deg_s, normal, Profile::Quintic);
+    // 每轮完成完整跳跃动作，剩余时间用于站立保持。
     for (int n = 0; n < count && !quit; ++n) {
         const int index = n + 1;
         const auto cycle_start = Clock::now();
@@ -586,7 +636,7 @@ int main(int argc, char** argv)
         log.begin(index, cycle_start);
         // 上周期在stand等待；本周期先恢复蹬伸起点crouch，准备时间计入周期。
         leg.move("crouch", crouch, slow_deg_s, normal, Profile::Quintic);
-        leg.push_off(v_push);
+        leg.push_off(v_push); // 蹬伸。
         // 沿用jump_mit：push终点继续保持到误差<3度，最多等待0.2秒。
         const auto push_deadline = Clock::now() + std::chrono::milliseconds(200);
         leg.phase = "push_wait";
@@ -598,12 +648,12 @@ int main(int argc, char** argv)
         if (quit) break;
         // 蹬伸保持结束至触地判定的时间；包括land_arm及land_wait。
         const auto flight_start = Clock::now();
-        leg.fly_to_land(landing);
+        leg.fly_to_land(landing); // 转换到落地姿态。
         leg.land_arm(landing, 4.0);
         leg.land_wait(landing, 3.0, 150.0, true);
         const auto touchdown = Clock::now();
         if (quit) break;
-        leg.absorb(v_abs0, absorption);
+        leg.absorb(v_abs0, absorption); // 触地后缓冲下蹲。
         if (quit) break;
         const auto summary = log.complete(std::chrono::duration<double>(touchdown - flight_start).count());
         if (index % 10 == 0) {
@@ -612,7 +662,7 @@ int main(int argc, char** argv)
             std::fflush(stdout);
         }
         leg.hold(land_deep, absorption, 0.15, "land_deep_hold");
-        leg.return_to_stand();
+        leg.return_to_stand(); // 平滑恢复站立。
         leg.phase = "stand_hold";
         leg.in_flight = false;
         leg.set(stand, Pose{}, normal);
@@ -625,7 +675,7 @@ int main(int argc, char** argv)
         leg.hold_forever(stand, normal, "stand_hold");
     }
 
-    stopBus();
+    stopBus(); // 先停止收发线程，再写出日志。
     setMotorCycleObserver(nullptr, nullptr);
     return log.save(mass, period) ? 0 : 1;
 }
